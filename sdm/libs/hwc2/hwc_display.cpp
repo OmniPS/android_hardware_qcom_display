@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -89,8 +89,11 @@ HWC2::Error HWCColorMode::DeInit() {
 uint32_t HWCColorMode::GetColorModeCount() {
   uint32_t count = UINT32(color_mode_transform_map_.size());
   DLOGI("Supported color mode count = %d", count);
-
+#ifdef EXCLUDE_DISPLAY_PP
+  return count;
+#else
   return std::max(1U, count);
+#endif
 }
 
 HWC2::Error HWCColorMode::GetColorModes(uint32_t *out_num_modes,
@@ -120,6 +123,16 @@ HWC2::Error HWCColorMode::SetColorMode(android_color_mode_t mode) {
   }
 
   return status;
+}
+
+HWC2::Error HWCColorMode::RestoreColorTransform() {
+  DisplayError error = display_intf_->SetColorTransform(kColorTransformMatrixCount, color_matrix_);
+  if (error != kErrorNone) {
+    DLOGE("Failed to set Color Transform");
+    return HWC2::Error::BadParameter;
+  }
+
+  return HWC2::Error::None;
 }
 
 HWC2::Error HWCColorMode::SetColorTransform(const float *matrix, android_color_transform_t hint) {
@@ -192,8 +205,10 @@ void HWCColorMode::PopulateColorModes() {
   // SDM returns modes which is string combination of mode + transform.
   DisplayError error = display_intf_->GetColorModeCount(&color_mode_count);
   if (error != kErrorNone || (color_mode_count == 0)) {
+#ifndef EXCLUDE_DISPLAY_PP
     DLOGW("GetColorModeCount failed, use native color mode");
     PopulateTransform(HAL_COLOR_MODE_NATIVE, "native", "identity");
+#endif
     return;
   }
 
@@ -391,6 +406,9 @@ int HWCDisplay::Deinit() {
   }
 
   delete client_target_;
+  for (auto hwc_layer : layer_set_) {
+    delete hwc_layer;
+  }
 
   if (color_mode_) {
     color_mode_->DeInit();
@@ -452,6 +470,7 @@ void HWCDisplay::BuildLayerStack() {
   metadata_refresh_rate_ = 0;
   auto working_primaries = ColorPrimaries_BT709_5;
   bool secure_display_active = false;
+  layer_stack_.flags.animating = animating_;
 
   // Add one layer for fb target
   // TODO(user): Add blit target layers
@@ -1419,6 +1438,7 @@ void HWCDisplay::DumpInputBuffers() {
     return;
   }
 
+  DLOGI("dump_frame_count %d dump_input_layers %d", dump_frame_count_, dump_input_layers_);
   snprintf(dir_path, sizeof(dir_path), "%s/frame_dump_%s", HWCDebugHandler::DumpDir(),
            GetDisplayString());
 
@@ -1447,22 +1467,43 @@ void HWCDisplay::DumpInputBuffers() {
       }
     }
 
-    if (pvt_handle && pvt_handle->base) {
-      char dump_file_name[PATH_MAX];
-      size_t result = 0;
+    DLOGI("Dump layer[%d] of %d pvt_handle %x pvt_handle->base %x", i, layer_stack_.layers.size(),
+          pvt_handle, pvt_handle? pvt_handle->base : 0);
 
-      snprintf(dump_file_name, sizeof(dump_file_name), "%s/input_layer%d_%dx%d_%s_frame%d.raw",
-               dir_path, i, pvt_handle->width, pvt_handle->height,
-               qdutils::GetHALPixelFormatString(pvt_handle->format), dump_frame_index_);
-
-      FILE *fp = fopen(dump_file_name, "w+");
-      if (fp) {
-        result = fwrite(reinterpret_cast<void *>(pvt_handle->base), pvt_handle->size, 1, fp);
-        fclose(fp);
-      }
-
-      DLOGI("Frame Dump %s: is %s", dump_file_name, result ? "Successful" : "Failed");
+    if (!pvt_handle) {
+      DLOGE("Buffer handle is null");
+      return;
     }
+
+    if (!pvt_handle->base) {
+      DisplayError error = buffer_allocator_->MapBuffer(pvt_handle, -1);
+      if (error != kErrorNone) {
+        DLOGE("Failed to map buffer, error = %d", error);
+        return;
+      }
+    }
+
+    char dump_file_name[PATH_MAX];
+    size_t result = 0;
+
+    snprintf(dump_file_name, sizeof(dump_file_name), "%s/input_layer%d_%dx%d_%s_frame%d.raw",
+             dir_path, i, pvt_handle->width, pvt_handle->height,
+             qdutils::GetHALPixelFormatString(pvt_handle->format), dump_frame_index_);
+
+    FILE *fp = fopen(dump_file_name, "w+");
+    if (fp) {
+      result = fwrite(reinterpret_cast<void *>(pvt_handle->base), pvt_handle->size, 1, fp);
+      fclose(fp);
+    }
+
+    int release_fence = -1;
+    DisplayError error = buffer_allocator_->UnmapBuffer(pvt_handle, &release_fence);
+    if (error != kErrorNone) {
+      DLOGE("Failed to unmap buffer, error = %d", error);
+      return;
+    }
+
+    DLOGI("Frame Dump %s: is %s", dump_file_name, result ? "Successful" : "Failed");
   }
 }
 
@@ -1703,13 +1744,14 @@ void HWCDisplay::MarkLayersForGPUBypass() {
 }
 
 void HWCDisplay::MarkLayersForClientComposition() {
-  // ClientComposition - GPU comp, to acheive this, set skip flag so that
+  // ClientComposition - GPU comp, to achieve this, set skip flag so that
   // SDM does not handle this layer and hwc_layer composition will be
   // set correctly at the end of Prepare.
   for (auto hwc_layer : layer_set_) {
     Layer *layer = hwc_layer->GetSDMLayer();
     layer->flags.skip = true;
   }
+  layer_stack_.flags.skip_present = true;
 }
 
 void HWCDisplay::ApplyScanAdjustment(hwc_rect_t *display_frame) {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2014-2017, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2014-2018, The Linux Foundation. All rights reserved.
  * Not a Contribution.
  *
  * Copyright 2015 The Android Open Source Project
@@ -23,6 +23,7 @@
 #include <utils/constants.h>
 #include <utils/String16.h>
 #include <cutils/properties.h>
+#include <bfqio/bfqio.h>
 #include <hardware_legacy/uevent.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
@@ -78,6 +79,7 @@ void HWCUEvent::UEventThread(HWCUEvent *hwc_uevent) {
 
   prctl(PR_SET_NAME, uevent_thread_name, 0, 0, 0);
   setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
+  android_set_rt_ioprio(0, 1);
 
   int status = uevent_init();
   if (!status) {
@@ -297,16 +299,25 @@ void HWCSession::GetCapabilities(struct hwc2_device *device, uint32_t *outCount,
   }
 
   int value = 0;
+  uint32_t count = 0;
   bool disable_skip_validate = false;
+  HWCSession *hwc_session = static_cast<HWCSession *>(device);
+  bool color_transform_supported = hwc_session->core_intf_->IsColorTransformSupported();
+
   if (Debug::Get()->GetProperty("sdm.debug.disable_skip_validate", &value) == kErrorNone) {
     disable_skip_validate = (value == 1);
   }
-  uint32_t count = 1 + (disable_skip_validate ? 0 : 1);
+
+  count += (color_transform_supported) ? 1 : 0;
+  count += (!disable_skip_validate) ? 1 : 0;
 
   if (outCapabilities != nullptr && (*outCount >= count)) {
-    outCapabilities[0] = HWC2_CAPABILITY_SKIP_CLIENT_COLOR_TRANSFORM;
+    int i = 0;
+    if (color_transform_supported) {
+      outCapabilities[i++] = HWC2_CAPABILITY_SKIP_CLIENT_COLOR_TRANSFORM;
+    }
     if (!disable_skip_validate) {
-      outCapabilities[1] = HWC2_CAPABILITY_SKIP_VALIDATE;
+      outCapabilities[i++] = HWC2_CAPABILITY_SKIP_VALIDATE;
     }
   }
   *outCount = count;
@@ -500,7 +511,9 @@ static int32_t GetHdrCapabilities(hwc2_device_t* device, hwc2_display_t display,
 }
 
 static uint32_t GetMaxVirtualDisplayCount(hwc2_device_t *device) {
-  return 1;
+  char property[PROPERTY_VALUE_MAX];
+  property_get("debug.sdm.support_writeback", property, "1");
+  return (uint32_t) atoi(property);
 }
 
 static int32_t GetReleaseFences(hwc2_device_t *device, hwc2_display_t display,
@@ -1069,7 +1082,7 @@ android::status_t HWCSession::HandleGetDisplayAttributesForConfig(const android:
   int error = android::BAD_VALUE;
   DisplayConfigVariableInfo display_attributes;
 
-  if (dpy > HWC_DISPLAY_VIRTUAL) {
+  if (dpy < HWC_DISPLAY_PRIMARY || dpy >= HWC_NUM_DISPLAY_TYPES || config < 0) {
     return android::BAD_VALUE;
   }
 
@@ -1218,6 +1231,10 @@ android::status_t HWCSession::SetColorModeOverride(const android::Parcel *input_
   auto mode = static_cast<android_color_mode_t>(input_parcel->readInt32());
   auto device = static_cast<hwc2_device_t *>(this);
 
+  if (display >= HWC_NUM_DISPLAY_TYPES) {
+    return -EINVAL;
+  }
+
   SEQUENCE_WAIT_SCOPE_LOCK(locker_[display]);
   auto err = CallDisplayFunction(device, display, &HWCDisplay::SetColorMode, mode);
   if (err != HWC2_ERROR_NONE)
@@ -1300,56 +1317,73 @@ android::status_t HWCSession::QdcmCMDHandler(const android::Parcel *input_parcel
     return ret;
   }
 
-  switch (pending_action.action) {
-    case kInvalidating:
-      Refresh(HWC_DISPLAY_PRIMARY);
-      break;
-    case kEnterQDCMMode:
-      ret = color_mgr_->EnableQDCMMode(true, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      break;
-    case kExitQDCMMode:
-      ret = color_mgr_->EnableQDCMMode(false, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      break;
-    case kApplySolidFill:
-      ret =
-          color_mgr_->SetSolidFill(pending_action.params, true, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      Refresh(HWC_DISPLAY_PRIMARY);
-      break;
-    case kDisableSolidFill:
-      ret =
-          color_mgr_->SetSolidFill(pending_action.params, false, hwc_display_[HWC_DISPLAY_PRIMARY]);
-      Refresh(HWC_DISPLAY_PRIMARY);
-      break;
-    case kSetPanelBrightness:
-      brightness_value = reinterpret_cast<int32_t *>(resp_payload.payload);
-      if (brightness_value == NULL) {
-        DLOGE("Brightness value is Null");
-        return -EINVAL;
-      }
-      if (HWC_DISPLAY_PRIMARY == display_id)
-        ret = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPanelBrightness(*brightness_value);
-      break;
-    case kEnableFrameCapture:
-      ret = color_mgr_->SetFrameCapture(pending_action.params, true,
-                                        hwc_display_[HWC_DISPLAY_PRIMARY]);
-      Refresh(HWC_DISPLAY_PRIMARY);
-      break;
-    case kDisableFrameCapture:
-      ret = color_mgr_->SetFrameCapture(pending_action.params, false,
-                                        hwc_display_[HWC_DISPLAY_PRIMARY]);
-      break;
-    case kConfigureDetailedEnhancer:
-      ret = color_mgr_->SetDetailedEnhancer(pending_action.params,
-                                            hwc_display_[HWC_DISPLAY_PRIMARY]);
-      Refresh(HWC_DISPLAY_PRIMARY);
-      break;
-    case kNoAction:
-      break;
-    default:
-      DLOGW("Invalid pending action = %d!", pending_action.action);
-      break;
-  }
 
+  int32_t action = pending_action.action;
+  int count = -1;
+  while (action > 0) {
+    count++;
+    int32_t bit = (action & 1);
+    action = action >> 1;
+
+    if (!bit)
+      continue;
+
+    DLOGV_IF(kTagQDCM, "pending action = %d", BITMAP(count));
+    switch (BITMAP(count)) {
+      case kInvalidating:
+        Refresh(HWC_DISPLAY_PRIMARY);
+        break;
+      case kEnterQDCMMode:
+        ret = color_mgr_->EnableQDCMMode(true, hwc_display_[HWC_DISPLAY_PRIMARY]);
+        break;
+      case kExitQDCMMode:
+        ret = color_mgr_->EnableQDCMMode(false, hwc_display_[HWC_DISPLAY_PRIMARY]);
+        break;
+      case kApplySolidFill:
+        ret = color_mgr_->SetSolidFill(pending_action.params,
+                                            true, hwc_display_[HWC_DISPLAY_PRIMARY]);
+        Refresh(HWC_DISPLAY_PRIMARY);
+        break;
+      case kDisableSolidFill:
+        ret = color_mgr_->SetSolidFill(pending_action.params,
+                                            false, hwc_display_[HWC_DISPLAY_PRIMARY]);
+        Refresh(HWC_DISPLAY_PRIMARY);
+        break;
+      case kSetPanelBrightness:
+        brightness_value = reinterpret_cast<int32_t *>(resp_payload.payload);
+        if (brightness_value == NULL) {
+          DLOGE("Brightness value is Null");
+          return -EINVAL;
+        }
+        if (HWC_DISPLAY_PRIMARY == display_id)
+          ret = hwc_display_[HWC_DISPLAY_PRIMARY]->SetPanelBrightness(*brightness_value);
+        break;
+      case kEnableFrameCapture:
+        ret = color_mgr_->SetFrameCapture(pending_action.params, true,
+                                        hwc_display_[HWC_DISPLAY_PRIMARY]);
+        Refresh(HWC_DISPLAY_PRIMARY);
+        break;
+      case kDisableFrameCapture:
+        ret = color_mgr_->SetFrameCapture(pending_action.params, false,
+                                        hwc_display_[HWC_DISPLAY_PRIMARY]);
+        break;
+      case kConfigureDetailedEnhancer:
+        ret = color_mgr_->SetDetailedEnhancer(pending_action.params,
+                                              hwc_display_[HWC_DISPLAY_PRIMARY]);
+        Refresh(HWC_DISPLAY_PRIMARY);
+        break;
+      case kModeSet:
+        ret = static_cast<int>
+                 (hwc_display_[HWC_DISPLAY_PRIMARY]->RestoreColorTransform());
+        Refresh(HWC_DISPLAY_PRIMARY);
+        break;
+      case kNoAction:
+        break;
+      default:
+        DLOGW("Invalid pending action = %d!", pending_action.action);
+        break;
+    }
+  }
   // for display API getter case, marshall returned params into out_parcel.
   output_parcel->writeInt32(ret);
   HWCColorManager::MarshallStructIntoParcel(resp_payload, output_parcel);
@@ -1516,7 +1550,7 @@ int HWCSession::GetVsyncPeriod(int disp) {
 android::status_t HWCSession::GetVisibleDisplayRect(const android::Parcel *input_parcel,
                                                     android::Parcel *output_parcel) {
   int dpy = input_parcel->readInt32();
-  if (dpy < HWC_DISPLAY_PRIMARY || dpy > HWC_DISPLAY_VIRTUAL) {
+  if (dpy < HWC_DISPLAY_PRIMARY || dpy >= HWC_NUM_DISPLAY_TYPES) {
     return android::BAD_VALUE;
   }
 

@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2014 - 2017, The Linux Foundation. All rights reserved.
+* Copyright (c) 2014 - 2018, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -33,6 +33,7 @@
 #include <utils/constants.h>
 #include <utils/String16.h>
 #include <cutils/properties.h>
+#include <bfqio/bfqio.h>
 #include <hardware_legacy/uevent.h>
 #include <sys/resource.h>
 #include <sys/prctl.h>
@@ -1009,7 +1010,7 @@ android::status_t HWCSession::HandleGetDisplayAttributesForConfig(const android:
   DisplayPort sdm_disp_port = kPortDefault;
   int hwc_disp_port = qdutils::DISPLAY_PORT_DEFAULT;
 
-  if (dpy > HWC_DISPLAY_VIRTUAL) {
+  if (dpy < HWC_DISPLAY_PRIMARY || dpy >= HWC_NUM_DISPLAY_TYPES || config < 0) {
     return android::BAD_VALUE;
   }
 
@@ -1430,6 +1431,7 @@ void* HWCSession::HWCUeventThreadHandler() {
   uevent_locker_.Lock();
   prctl(PR_SET_NAME, uevent_thread_name_, 0, 0, 0);
   setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
+  android_set_rt_ioprio(0, 1);
   if (!uevent_init()) {
     DLOGE("Failed to init uevent");
     pthread_exit(0);
@@ -1690,7 +1692,7 @@ android::status_t HWCSession::GetVisibleDisplayRect(const android::Parcel *input
                                                     android::Parcel *output_parcel) {
   int dpy = input_parcel->readInt32();
 
-  if (dpy < HWC_DISPLAY_PRIMARY || dpy > HWC_DISPLAY_VIRTUAL) {
+  if (dpy < HWC_DISPLAY_PRIMARY || dpy >= HWC_NUM_DISPLAY_TYPES) {
     return android::BAD_VALUE;;
   }
 
